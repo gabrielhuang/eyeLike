@@ -14,6 +14,16 @@ using namespace std;
 
 void findEyes(cv::Mat frame_gray, cv::Rect face);
 
+template<typename T>
+typename T to_range(T x, T a, T b)
+{
+	if (x < a) return a;
+	else if (x > b) return b;
+	else return x;
+}
+
+// TODO
+// account for frame interval
 struct Detect
 {
 	cv::KalmanFilter		kf;
@@ -23,17 +33,56 @@ struct Detect
 	unsigned				max_w;
 	unsigned				max_h;
 	bool					detected;
+	float					d_pos, d_size; // measurement variance
+	float					h_pos, h_size; // hysterisis
+	bool					use_hysterisis;
+	bool					use_filter;
+	unsigned				no_face;
+	unsigned				max_no_face;
 
 	Detect(cv::CascadeClassifier* classifier)
-		: kf(2, 2, 0)
+		: kf(4, 4, 0)
 		, max_w(150)
 		, max_h(150)
 		, classifier(classifier)
+		, d_pos(3.f)
+		, d_size(30.f)
+		, h_pos(7.f)
+		, h_size(9.f)
+		, use_hysterisis(true)
+		, use_filter(true)
+		, max_no_face(45) // frames
+		, no_face(45)
 	{
+		kf.transitionMatrix = *(cv::Mat_<float>(4, 4) << 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1);
+
+		kf.statePre.at<float>(0) = 100;
+		kf.statePre.at<float>(1) = 100;
+		kf.statePre.at<float>(2) = 100;
+		kf.statePre.at<float>(3) = 100;
+		cv::setIdentity(kf.measurementMatrix);
+		cv::setIdentity(kf.processNoiseCov, cv::Scalar::all(1));
+		kf.measurementNoiseCov = *(cv::Mat_<float>(4, 4) << 
+			d_pos, 0, 0, 0, 0, d_pos, 0, 0, 0, 0, d_size, 0, 0, 0, 0, d_size); 
+
+		cv::setIdentity(kf.errorCovPost, cv::Scalar::all(1.));
 	}
 
 	bool operator()(const cv::Mat& frame, cv::Mat& debugImage = cv::Mat())
 	{
+		// for debug only
+		{
+			char key = cv::waitKey(5);
+			float log_delta = 1.2f;
+			if (key == 'P') d_pos *= log_delta;
+			else if (key == 'p') d_pos /= log_delta;
+			else if (key == 'S') d_size *= log_delta;
+			else if (key == 's') d_size /= log_delta;
+			kf.measurementNoiseCov = *(cv::Mat_<float>(4, 4) <<
+				d_pos, 0, 0, 0, 0, d_pos, 0, 0, 0, 0, d_size, 0, 0, 0, 0, d_size);
+			cout << "dpos = " << d_pos << " dsize = " << d_size << endl;
+		}
+
 		std::vector<cv::Mat> rgbChannels(3);
 		cv::split(frame, rgbChannels);
 		cv::Mat frame_gray = rgbChannels[2];
@@ -41,12 +90,73 @@ struct Detect
 		classifier->detectMultiScale(frame_gray, faces, 1.1, 2, 
 			0 | CV_HAAR_SCALE_IMAGE | CV_HAAR_FIND_BIGGEST_OBJECT, cv::Size(max_w, max_h));
 		
-		if (detected = !faces.empty())
+		if (!faces.empty())
 		{
 			current_face = faces.front();
-			filtered_face = current_face;
-			cv::rectangle(debugImage, current_face, 1234);
-			findEyes(frame_gray, current_face);
+			
+			cv::Mat_<float> m(4, 1); // measurement
+			m(0) = current_face.x + float(current_face.width) / 2.f;
+			m(1) = current_face.y + float(current_face.height) / 2.f;
+			m(2) = current_face.width;
+			m(3) = current_face.height;
+			kf.predict();
+			cv::Mat_<float> corrected = kf.correct(m);
+
+			cv::Rect tmp_face;
+			tmp_face.width = to_range<float>(corrected(2), 20, frame_gray.cols - 1);
+			tmp_face.height = to_range<float>(corrected(3), 20, frame_gray.rows - 1);
+			tmp_face.x = to_range<float>(corrected(0) - corrected(2) / 2.f, 0, frame_gray.cols - filtered_face.width - 1);
+			tmp_face.y = to_range<float>(corrected(1) - corrected(3) / 2.f, 0, frame_gray.rows - filtered_face.height - 1);
+
+			if (use_hysterisis)
+			{
+				float h_p = max(abs(tmp_face.x - filtered_face.x), abs(tmp_face.y - filtered_face.y));
+				float h_s = max(abs(tmp_face.width - filtered_face.width), abs(tmp_face.height - filtered_face.height));
+				if (h_p > h_pos || h_s > h_size)
+				{
+					//debug only
+					{
+						cout << "Moved" << endl;
+					}
+					filtered_face = tmp_face;
+				}
+			}
+			else
+			{
+				filtered_face = tmp_face;
+			}
+
+			cv::rectangle(debugImage, current_face, cv::Scalar(255, 0, 0), 1);
+
+			no_face = 0;
+			detected = true;
+		}
+		else // not detected
+		{
+			if (no_face < max_no_face)
+			{
+				cv::Mat_<float> corrected = kf.predict();
+				filtered_face.width = to_range<float>(corrected(2), 20, frame_gray.cols - 1);
+				filtered_face.height = to_range<float>(corrected(3), 20, frame_gray.rows - 1);
+				filtered_face.x = to_range<float>(corrected(0) - corrected(2) / 2.f, 0, frame_gray.cols - filtered_face.width - 1);
+				filtered_face.y = to_range<float>(corrected(1) - corrected(3) / 2.f, 0, frame_gray.rows - filtered_face.height - 1);
+				detected = true;
+				++no_face;
+			}
+			else
+			{
+				detected = false;
+			}
+		}
+
+		if (detected)
+		{
+			cv::rectangle(debugImage, filtered_face, cv::Scalar(0, 255, 255), 2);
+			cv::circle(debugImage, 
+				cv::Point(filtered_face.x + filtered_face.width / 2, filtered_face.y + filtered_face.height / 2),
+				3,
+				cv::Scalar(0, 255, 0), -1);
+			findEyes(frame_gray, filtered_face);
 		}
 
 		return detected;
